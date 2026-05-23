@@ -88,18 +88,25 @@ impl Context {
     }
 }
 
-/// Each entry is OR'd: `$all-user` → NOT IN agents, `$all-agent` → IN agents, literal → exact match.
-fn apply_author_filter(sql: &mut SqlBuilder, authors: &[String]) {
+fn author_filter_condition(alias: Option<&str>, authors: &[String]) -> Option<String> {
     let mut conditions: Vec<String> = Vec::new();
     let agent_list: String = KNOWN_AGENTS.iter().map(quote).join(", ");
-    let author_expr = "CASE \
-        WHEN author IS NULL OR trim(author) = '' THEN \
+    let column = |name: &str| match alias {
+        Some(alias) => format!("{alias}.{name}"),
+        None => name.to_string(),
+    };
+    let author = column("author");
+    let hostname = column("hostname");
+    let author_expr = format!(
+        "CASE \
+        WHEN {author} IS NULL OR trim({author}) = '' THEN \
             CASE \
-                WHEN instr(hostname, ':') > 0 THEN substr(hostname, instr(hostname, ':') + 1) \
-                ELSE hostname \
+                WHEN instr({hostname}, ':') > 0 THEN substr({hostname}, instr({hostname}, ':') + 1) \
+                ELSE {hostname} \
             END \
-        ELSE author \
-    END";
+        ELSE {author} \
+    END"
+    );
 
     for author in authors {
         match author.as_str() {
@@ -115,8 +122,17 @@ fn apply_author_filter(sql: &mut SqlBuilder, authors: &[String]) {
         }
     }
 
-    if !conditions.is_empty() {
-        sql.and_where(format!("({})", conditions.join(" OR ")));
+    if conditions.is_empty() {
+        None
+    } else {
+        Some(format!("({})", conditions.join(" OR ")))
+    }
+}
+
+/// Each entry is OR'd: `$all-user` → NOT IN agents, `$all-agent` → IN agents, literal → exact match.
+fn apply_author_filter(sql: &mut SqlBuilder, authors: &[String]) {
+    if let Some(condition) = author_filter_condition(None, authors) {
+        sql.and_where(condition);
     }
 }
 
@@ -300,6 +316,100 @@ impl Sqlite {
             )
             .build()
             .into()
+    }
+
+    fn can_use_empty_unique_search(
+        query: &str,
+        filter: FilterMode,
+        filter_options: &OptFilters,
+    ) -> bool {
+        query.is_empty()
+            && !filter_options.include_duplicates
+            && filter_options.offset.is_none()
+            && !filter_options.reverse
+            && filter_options.exit.is_none()
+            && filter_options.exclude_exit.is_none()
+            && filter_options.cwd.is_none()
+            && filter_options.exclude_cwd.is_none()
+            && filter_options.before.is_none()
+            && filter_options.after.is_none()
+            && filter != FilterMode::SessionPreload
+    }
+
+    fn empty_unique_conditions(
+        alias: &str,
+        filter: FilterMode,
+        context: &Context,
+        filter_options: &OptFilters,
+    ) -> Vec<String> {
+        let mut conditions = vec![format!("{alias}.deleted_at is null")];
+
+        let git_root = if let Some(git_root) = context.git_root.clone() {
+            git_root.to_str().unwrap_or("/").to_string()
+        } else {
+            context.cwd.clone()
+        };
+
+        match filter {
+            FilterMode::Global => {}
+            FilterMode::Host => conditions.push(format!(
+                "lower({alias}.hostname) = {}",
+                quote(context.hostname.to_lowercase())
+            )),
+            FilterMode::Session => {
+                conditions.push(format!("{alias}.session = {}", quote(&context.session)));
+            }
+            FilterMode::Directory => {
+                conditions.push(format!("{alias}.cwd = {}", quote(&context.cwd)));
+            }
+            FilterMode::Workspace => {
+                conditions.push(format!("{alias}.cwd LIKE '{}%'", esc(git_root)));
+            }
+            FilterMode::SessionPreload => unreachable!("guarded by can_use_empty_unique_search"),
+        }
+
+        if let Some(condition) = author_filter_condition(Some(alias), &filter_options.authors) {
+            conditions.push(condition);
+        }
+
+        conditions
+    }
+
+    async fn search_empty_unique(
+        &self,
+        filter: FilterMode,
+        context: &Context,
+        filter_options: &OptFilters,
+    ) -> Result<Vec<History>> {
+        let outer_conditions =
+            Self::empty_unique_conditions("h", filter, context, filter_options).join(" AND ");
+        let inner_conditions =
+            Self::empty_unique_conditions("h2", filter, context, filter_options).join(" AND ");
+        let limit = filter_options
+            .limit
+            .map(|limit| format!(" LIMIT {limit}"))
+            .unwrap_or_default();
+
+        let query = format!(
+            "SELECT h.* \
+             FROM history h \
+             WHERE {outer_conditions} \
+               AND NOT EXISTS ( \
+                   SELECT 1 \
+                   FROM history h2 \
+                   WHERE h2.command = h.command \
+                     AND (h2.timestamp > h.timestamp OR (h2.timestamp = h.timestamp AND h2.id > h.id)) \
+                     AND {inner_conditions} \
+               ) \
+             ORDER BY h.timestamp DESC{limit}"
+        );
+
+        let res = sqlx::query(&query)
+            .map(Self::query_history)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(res)
     }
 }
 
@@ -492,6 +602,12 @@ impl Database for Sqlite {
         query: &str,
         filter_options: OptFilters,
     ) -> Result<Vec<History>> {
+        if Self::can_use_empty_unique_search(query, filter, &filter_options) {
+            return self
+                .search_empty_unique(filter, context, &filter_options)
+                .await;
+        }
+
         let mut sql = SqlBuilder::select_from("history");
 
         if !filter_options.include_duplicates {
@@ -973,6 +1089,7 @@ mod test {
 
     use super::*;
     use std::time::{Duration, Instant};
+    use time::macros::datetime;
 
     async fn assert_search_eq(
         db: &impl Database,
@@ -1039,6 +1156,139 @@ mod test {
         captured.hostname = "booop".to_string();
 
         db.save(&captured).await
+    }
+
+    fn imported_history(
+        command: &str,
+        timestamp: OffsetDateTime,
+        cwd: &str,
+        author: &str,
+    ) -> History {
+        History::import()
+            .timestamp(timestamp)
+            .command(command)
+            .cwd(cwd)
+            .exit(0)
+            .duration(1)
+            .session("beepboopiamasession")
+            .hostname("test:host")
+            .author(author)
+            .build()
+            .into()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_empty_returns_recent_unique_commands() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let context = Context {
+            hostname: "test:host".to_string(),
+            session: "beepboopiamasession".to_string(),
+            cwd: "/home/ellie".to_string(),
+            host_id: "test-host".to_string(),
+            git_root: None,
+        };
+
+        let old_git = imported_history(
+            "git status",
+            datetime!(2024-01-01 10:00 UTC),
+            "/home/ellie",
+            "mark",
+        );
+        let ls = imported_history("ls", datetime!(2024-01-01 11:00 UTC), "/home/ellie", "mark");
+        let new_git = imported_history(
+            "git status",
+            datetime!(2024-01-01 12:00 UTC),
+            "/home/ellie",
+            "mark",
+        );
+
+        db.save_bulk(&[old_git, ls.clone(), new_git.clone()])
+            .await
+            .unwrap();
+
+        let results = db
+            .search(
+                SearchMode::FullText,
+                FilterMode::Global,
+                &context,
+                "",
+                OptFilters {
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|h| h.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["git status", "ls"]
+        );
+        assert_eq!(results[0].id, new_git.id);
+        assert_eq!(results[1].id, ls.id);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_search_empty_author_filter_dedupes_after_filtering() {
+        let db = Sqlite::new("sqlite::memory:", test_local_timeout())
+            .await
+            .unwrap();
+        let context = Context {
+            hostname: "test:host".to_string(),
+            session: "beepboopiamasession".to_string(),
+            cwd: "/home/ellie".to_string(),
+            host_id: "test-host".to_string(),
+            git_root: None,
+        };
+
+        let user_git = imported_history(
+            "git status",
+            datetime!(2024-01-01 10:00 UTC),
+            "/home/ellie",
+            "mark",
+        );
+        let user_ls =
+            imported_history("ls", datetime!(2024-01-01 11:00 UTC), "/home/ellie", "mark");
+        let agent_git = imported_history(
+            "git status",
+            datetime!(2024-01-01 12:00 UTC),
+            "/home/ellie",
+            "codex",
+        );
+
+        db.save_bulk(&[user_git.clone(), user_ls.clone(), agent_git])
+            .await
+            .unwrap();
+
+        let results = db
+            .search(
+                SearchMode::FullText,
+                FilterMode::Global,
+                &context,
+                "",
+                OptFilters {
+                    limit: Some(200),
+                    authors: vec![AUTHOR_FILTER_ALL_USER.to_string()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|h| h.command.as_str())
+                .collect::<Vec<_>>(),
+            vec!["ls", "git status"]
+        );
+        assert_eq!(results[0].id, user_ls.id);
+        assert_eq!(results[1].id, user_git.id);
     }
 
     #[tokio::test(flavor = "multi_thread")]
